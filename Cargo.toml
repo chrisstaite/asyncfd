@@ -1,0 +1,17 @@
+[package]
+name = "asyncfd"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Send and receive file descriptors over Unix domain sockets while maintaining Tokio AsyncRead and AsyncWrite"
+authors = ["Christopher Staite"]
+readme = "README.md"
+repository = "https://github.com/chrisstaite/asyncfd/"
+categories = ["os::unix-apis", "asynchronous", "network-programming"]
+
+[dependencies]
+tokio = { version = "1.42.0", features = ["net"] }
+libc = "0.2.169"
+
+[dev-dependencies]
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "rt", "macros", "io-util"] }

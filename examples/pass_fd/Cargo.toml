@@ -1,0 +1,12 @@
+[package]
+name = "pass-fd"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+asyncfd = { path = "../../" }
+tokio = { version = "1.42.0", features = ["full"] }
+
+[[bin]]
+name = "pass_fd"
+path = "./main.rs"
