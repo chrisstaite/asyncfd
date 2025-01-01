@@ -38,6 +38,12 @@ Both of these crates use dummy data to pass file descriptors, whereas this crate
 provided in this crate, the socket can simply be used by Tokio in a normal way but the implementor
 can add and take file descriptors depending on the sent message.
 
+[sendfd](https://github.com/standard-ai/sendfd)
+
+This implementation supports Tokio, but does not take ownership of the RawFds and as such cannot
+provide the `AsyncRead` and `AsyncWrite` traits meaning that much more boiler plate is required
+by a use of this crate.
+
 ## License
 
 This project is licensed with the
