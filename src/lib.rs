@@ -10,6 +10,7 @@ use std::task::{ready, Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// A wrapper around a `UnixStream` that allows file descriptors to be
 /// sent and received with messages.  Implements `AsyncRead` and
@@ -17,8 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// operations and helpers may be used.
 pub struct UnixFdStream<T: AsRawFd> {
     inner: AsyncFd<T>,
-    outgoing_fds: Mutex<Vec<RawFd>>,
     incoming_fds: Mutex<VecDeque<RawFd>>,
+    outgoing_tx: UnboundedSender<RawFd>,
+    outgoing_rx: UnboundedReceiver<RawFd>,
     max_read_fds: usize,
 }
 
@@ -85,11 +87,12 @@ impl<T: AsRawFd> UnixFdStream<T> {
     /// kernel.  We do not check for the MSG_CTRUNC flag, therefore this
     /// will be a silent discard.
     pub fn new(unix: T, max_read_fds: usize) -> Result<Self> {
-        //unix.set_nonblocking(true)?;
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             inner: AsyncFd::new(unix)?,
-            outgoing_fds: Mutex::new(Vec::new()),
             incoming_fds: Mutex::new(VecDeque::new()),
+            outgoing_tx,
+            outgoing_rx,
             max_read_fds,
         })
     }
@@ -99,9 +102,18 @@ impl<T: AsRawFd> UnixFdStream<T> {
     /// file descriptor is either closed when the message is sent or this
     /// instance is dropped.
     pub fn push_outgoing_fd<F: IntoRawFd>(&self, fd: F) {
-        if let Ok(mut guard) = self.outgoing_fds.lock() {
-            guard.push(fd.into_raw_fd());
+        if let Err(fd) = self.outgoing_tx.send(fd.into_raw_fd()) {
+            // This should never happen, but implemented for completeness.
+            // SAFETY: We just failed to push this file descriptor, so we have to
+            //         close it.
+            unsafe { libc::close(fd.0); }
         }
+    }
+
+    /// Wait for the underlying UnixStream to become readable.
+    pub async fn readable(&self) -> Result<()> {
+        self.inner.readable().await?.retain_ready();
+        Ok(())
     }
 
     /// Get the most recent file descriptor that was read with a message.
@@ -121,11 +133,11 @@ impl<T: AsRawFd> UnixFdStream<T> {
             .unwrap_or(0)
     }
 
-    fn write_simple(&self, buf: &[u8]) -> Result<usize> {
+    fn write_simple(socket: RawFd, buf: &[u8]) -> Result<usize> {
         // SAFETY: The socket is owned by us and the buffer is of known size.
         let rv = unsafe {
             libc::send(
-                self.inner.as_raw_fd(),
+                socket,
                 buf.as_ptr() as *const c_void,
                 buf.len(),
                 0,
@@ -137,36 +149,24 @@ impl<T: AsRawFd> UnixFdStream<T> {
         Ok(rv as usize)
     }
 
-    fn add_to_outgoing(&self, mut fds: Vec<RawFd>) {
-        if let Ok(mut guard) = self.outgoing_fds.lock() {
-            // Inject to the front again to try and maintain ordering.
-            while let Some(fd) = fds.pop() {
-                guard.insert(0, fd);
-            }
-        } else {
-            // SAFETY: We own the file descriptors, so it's safe to close them.
-            unsafe {
-                close_fds(fds);
+    fn add_to_outgoing(&mut self, mut fds: Vec<RawFd>) {
+        // Just in case there were other file descriptors added, pull them from the channel.
+        while let Ok(fd) = self.outgoing_rx.try_recv() {
+            fds.push(fd);
+        }
+        // Push all the file descriptors to the channel in order.
+        for fd in fds.into_iter() {
+            if let Err(fd) = self.outgoing_tx.send(fd) {
+                // This is impossible as we own the rx, but just for completeness.
+                // SAFETY: We own this file descriptor and are about to drop it on the
+                //         floor, so it's safe to close it.
+                unsafe { libc::close(fd.0); }
             }
         }
     }
 
-    fn raw_write(&self, buf: &[u8]) -> Result<usize> {
-        let mut outgoing_fds = Vec::<RawFd>::new();
-        if let Ok(mut guard) = self.outgoing_fds.lock() {
-            std::mem::swap(&mut *guard, &mut outgoing_fds);
-        }
-        // Shortcut if there's no file descriptors to send.
-        if outgoing_fds.is_empty() {
-            return self.write_simple(buf);
-        }
-        let header = match Header::new(outgoing_fds.len()) {
-            Ok(header) => header,
-            Err(err) => {
-                self.add_to_outgoing(outgoing_fds);
-                return Err(err);
-            }
-        };
+    fn raw_write(socket: RawFd, outgoing_fds: &[RawFd], buf: &[u8]) -> Result<usize> {
+        let header = Header::new(outgoing_fds.len())?;
         let mut iov = libc::iovec {
             iov_base: buf.as_ptr() as *mut c_void,
             iov_len: buf.len(),
@@ -191,7 +191,7 @@ impl<T: AsRawFd> UnixFdStream<T> {
         // SAFETY: We have allocated correctly aligned memory, so this will point to
         //         the allocated memory within `header`.
         let mut data = unsafe { libc::CMSG_DATA(cmsg) as *mut c_int };
-        for fd in &outgoing_fds {
+        for fd in outgoing_fds {
             // SAFETY: We have a valid pointer to `header` and now we are copying
             //         the data that we created space for into it.
             data = unsafe {
@@ -201,15 +201,9 @@ impl<T: AsRawFd> UnixFdStream<T> {
         }
         // SAFETY: We just set up the message to send, so we're all safe to attempt to
         //         send it, also the socket that we are sending on is owned by us.
-        let rv = unsafe { libc::sendmsg(self.inner.as_raw_fd(), &msg, 0) };
+        let rv = unsafe { libc::sendmsg(socket, &msg, 0) };
         if rv < 0 {
-            // The operation failed, we need to put the file descriptors back.
-            self.add_to_outgoing(outgoing_fds);
             return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: We own the file descriptors, so it's safe to close them.
-        unsafe {
-            close_fds(outgoing_fds);
         }
         Ok(rv as usize)
     }
@@ -315,13 +309,10 @@ impl<T: AsRawFd> UnixFdStream<T> {
 
 impl<T: AsRawFd> Drop for UnixFdStream<T> {
     fn drop(&mut self) {
-        self.outgoing_fds.clear_poison();
-        let mut fds = Vec::new();
-        if let Ok(mut guard) = self.outgoing_fds.lock() {
-            std::mem::swap(&mut fds, &mut *guard);
+        while let Ok(fd) = self.outgoing_rx.try_recv() {
+            // SAFETY: It we own these file descriptors, so it's safe for us to close them.
+            unsafe { libc::close(fd); };
         }
-        // SAFETY: It we own these file descriptors, so it's safe for us to close them.
-        unsafe { close_fds(fds) };
 
         self.incoming_fds.clear_poison();
         let mut fds = VecDeque::new();
@@ -357,15 +348,44 @@ impl<T: AsRawFd> AsyncRead for UnixFdStream<T> {
 
 impl AsyncWrite for UnixFdStream<UnixStream> {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
+        let mut outgoing_fds = Vec::<RawFd>::new();
         loop {
-            let mut guard = ready!(self.inner.poll_write_ready(cx))?;
-
-            match guard.try_io(|_inner| self.raw_write(buf)) {
-                Ok(result) => return Poll::Ready(result),
+            while let Ok(fd) = self.outgoing_rx.try_recv() {
+                outgoing_fds.push(fd);
+            }
+            let mut guard = match self.inner.poll_write_ready(cx) {
+                Poll::Ready(Ok(guard)) => guard,
+                Poll::Ready(Err(err)) => {
+                    self.add_to_outgoing(outgoing_fds);
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => {
+                    self.add_to_outgoing(outgoing_fds);
+                    return Poll::Pending;
+                },
+            };
+            match guard.try_io(|inner| 
+                // Shortcut if there's no file descriptors to send.
+                if outgoing_fds.is_empty() {
+                    UnixFdStream::<UnixStream>::write_simple(inner.as_raw_fd(), buf)
+                } else {
+                    UnixFdStream::<UnixStream>::raw_write(inner.as_raw_fd(), &outgoing_fds, buf)
+                }) {
+                Ok(Ok(bytes)) => {
+                    // SAFETY: We own the file descriptors, so it's safe to close them.
+                    unsafe {
+                        close_fds(outgoing_fds);
+                    }
+                    return Poll::Ready(Ok(bytes))
+                }
+                Ok(Err(err)) => {
+                    self.add_to_outgoing(outgoing_fds);
+                    return Poll::Ready(Err(err))
+                }
                 Err(_would_block) => continue,
             }
         }
@@ -399,29 +419,34 @@ mod tests {
     #[tokio::test]
     async fn send_fd() {
         let (first, second) = std::os::unix::net::UnixStream::pair().unwrap();
-        let first_join = tokio::spawn(async move {
+        let sender = tokio::spawn(async move {
             let mut first = UnixFdStream::new(first, 0).unwrap();
             let (third, fourth) = std::os::unix::net::UnixStream::pair().unwrap();
             let mut third = tokio::net::UnixStream::from_std(third).unwrap();
             first.push_outgoing_fd(fourth);
-            first.write(b"test\n").await.unwrap();
-            third.write(b"test\n").await.unwrap();
+            first.write_all(b"test\n").await.unwrap();
+            first.shutdown().await.unwrap();
+            third.write_all(b"test\n").await.unwrap();
+            third.shutdown().await.unwrap();
+            // If we drop third before receiver has finished reading then the test is not
+            // stable, therefore we keep alive until the receiver drops its end.
+            let _ = third.readable().await;
         });
-        let second_join = tokio::spawn(async move {
+        let receiver = tokio::spawn(async move {
             let second = tokio::io::BufReader::new(UnixFdStream::new(second, 4).unwrap());
             let mut lines = second.lines();
-            assert_eq!("test", lines.next_line().await.unwrap().unwrap());
+            assert_eq!(Some("test"), lines.next_line().await.unwrap().as_deref());
             assert_eq!(1, lines.get_ref().get_ref().incoming_count());
-            let third = unsafe {
+            let fourth: std::os::unix::net::UnixStream = unsafe {
                 std::os::unix::net::UnixStream::from_raw_fd(
                     lines.get_ref().get_ref().pop_incoming_fd().unwrap(),
                 )
             };
-            let third = tokio::io::BufReader::new(tokio::net::UnixStream::from_std(third).unwrap());
-            assert_eq!("test", third.lines().next_line().await.unwrap().unwrap());
+            let fourth = tokio::io::BufReader::new(tokio::net::UnixStream::from_std(fourth).unwrap());
+            assert_eq!(Some("test"), fourth.lines().next_line().await.unwrap().as_deref());
         });
-        let (first_result, second_result) = tokio::join!(first_join, second_join);
-        first_result.unwrap();
-        second_result.unwrap();
+        let (send_result, receive_result) = tokio::join!(sender, receiver);
+        send_result.unwrap();
+        receive_result.unwrap();
     }
 }
