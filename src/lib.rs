@@ -41,7 +41,7 @@ impl Shutdown for UnixStream {
 /// This is the trait required to create a UnixFdStream as it needs to
 /// be non-blocking before it can be used.
 pub trait NonBlocking {
-    fn set_nonblocking(&self, blocking: bool) -> Result<()>;
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()>;
 }
 
 impl NonBlocking for UnixStream {
