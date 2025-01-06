@@ -1,16 +1,19 @@
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
 use std::io::{Error, Result};
-use std::mem;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{ready, Context, Poll};
 
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+
+mod header;
+mod split;
+mod split_owned;
 
 /// A wrapper around a `UnixStream` that allows file descriptors to be
 /// sent and received with messages.  Implements `AsyncRead` and
@@ -20,62 +23,40 @@ pub struct UnixFdStream<T: AsRawFd> {
     inner: AsyncFd<T>,
     incoming_fds: Mutex<VecDeque<RawFd>>,
     outgoing_tx: UnboundedSender<RawFd>,
-    outgoing_rx: UnboundedReceiver<RawFd>,
+    outgoing_rx: Option<UnboundedReceiver<RawFd>>,
     max_read_fds: usize,
 }
 
-unsafe fn close_fds<T: IntoIterator<Item = RawFd>>(fds: T) {
+/// This is the trait required to implement AsyncWrite for a type.
+pub trait Shutdown {
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()>;
+}
+
+impl Shutdown for UnixStream {
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        UnixStream::shutdown(self, how)
+    }
+}
+
+/// This is the trait required to create a UnixFdStream as it needs to
+/// be non-blocking before it can be used.
+pub trait NonBlocking {
+    fn set_nonblocking(&self, blocking: bool) -> Result<()>;
+}
+
+impl NonBlocking for UnixStream {
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        UnixStream::set_nonblocking(&self, nonblocking)
+    }
+}
+
+pub(crate) unsafe fn close_fds<T: IntoIterator<Item = RawFd>>(fds: T) {
     for fd in fds.into_iter() {
         libc::close(fd);
     }
 }
 
-struct Header {
-    layout: std::alloc::Layout,
-    data_length: usize,
-    header_length: usize,
-    pointer: *mut u8,
-}
-
-impl Header {
-    fn new(fd_count: usize) -> Result<Self> {
-        let data_length = mem::size_of::<c_int>() * fd_count;
-        // SAFETY: This isn't actually an unsafe operation, it's just some mem::size_of operations.
-        let header_length = unsafe { libc::CMSG_SPACE(data_length as u32) as usize };
-        // Create a header buffer that is large enough to store header_length, but aligned to cmsghdr.
-        let align = mem::align_of::<libc::cmsghdr>();
-        let size = std::cmp::max(header_length, mem::size_of::<libc::msghdr>());
-        let Ok(layout) = std::alloc::Layout::from_size_align(size, align) else {
-            return Err(Error::from(std::io::ErrorKind::OutOfMemory));
-        };
-        // SAFETY: We will look after this pointer and ensure that it is deallocated.
-        let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
-        if pointer.is_null() {
-            return Err(Error::from(std::io::ErrorKind::OutOfMemory));
-        }
-        Ok(Self {
-            data_length,
-            header_length,
-            layout,
-            pointer,
-        })
-    }
-
-    fn as_ptr(&self) -> *mut c_void {
-        self.pointer as *mut c_void
-    }
-}
-
-impl Drop for Header {
-    fn drop(&mut self) {
-        // SAFETY: This object only exists if this was allocated by us.
-        unsafe {
-            std::alloc::dealloc(self.pointer, self.layout);
-        }
-    }
-}
-
-impl<T: AsRawFd> UnixFdStream<T> {
+impl<T: AsRawFd + NonBlocking> UnixFdStream<T> {
     /// Create a new `UnixFdStream` from a `UnixStream` which is also
     /// configured to read up to `max_read_fds` for each read from the
     /// socket.
@@ -87,14 +68,49 @@ impl<T: AsRawFd> UnixFdStream<T> {
     /// kernel.  We do not check for the MSG_CTRUNC flag, therefore this
     /// will be a silent discard.
     pub fn new(unix: T, max_read_fds: usize) -> Result<Self> {
+        unix.set_nonblocking(true)?;
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             inner: AsyncFd::new(unix)?,
             incoming_fds: Mutex::new(VecDeque::new()),
             outgoing_tx,
-            outgoing_rx,
+            outgoing_rx: Some(outgoing_rx),
             max_read_fds,
         })
+    }
+}
+
+impl<T: AsRawFd> UnixFdStream<T> {
+    pub fn split<'a>(
+        &'a mut self,
+    ) -> (
+        crate::split::ReadHalf<'a, T>,
+        crate::split::WriteHalf<'a, T>,
+    ) {
+        let read =
+            crate::split::ReadHalf::<T>::new(&self.inner, &self.incoming_fds, &self.max_read_fds);
+        let write = crate::split::WriteHalf::<T>::new(
+            &self.inner,
+            &self.outgoing_tx,
+            self.outgoing_rx.as_mut().unwrap(),
+        );
+        (read, write)
+    }
+
+    pub fn into_split(
+        mut self,
+    ) -> (
+        crate::split_owned::OwnedReadHalf<T>,
+        crate::split_owned::OwnedWriteHalf<T>,
+    ) {
+        let rx: UnboundedReceiver<i32> = self.outgoing_rx.take().unwrap();
+        let own_self = Arc::new(self);
+        let write = crate::split_owned::OwnedWriteHalf::new(
+            own_self.clone(),
+            own_self.outgoing_tx.clone(),
+            rx,
+        );
+        (crate::split_owned::OwnedReadHalf::new(own_self), write)
     }
 
     /// Push a file descriptor to be written with the next message that
@@ -106,7 +122,9 @@ impl<T: AsRawFd> UnixFdStream<T> {
             // This should never happen, but implemented for completeness.
             // SAFETY: We just failed to push this file descriptor, so we have to
             //         close it.
-            unsafe { libc::close(fd.0); }
+            unsafe {
+                libc::close(fd.0);
+            }
         }
     }
 
@@ -135,14 +153,7 @@ impl<T: AsRawFd> UnixFdStream<T> {
 
     fn write_simple(socket: RawFd, buf: &[u8]) -> Result<usize> {
         // SAFETY: The socket is owned by us and the buffer is of known size.
-        let rv = unsafe {
-            libc::send(
-                socket,
-                buf.as_ptr() as *const c_void,
-                buf.len(),
-                0,
-            )
-        };
+        let rv = unsafe { libc::send(socket, buf.as_ptr() as *const c_void, buf.len(), 0) };
         if rv < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -151,7 +162,7 @@ impl<T: AsRawFd> UnixFdStream<T> {
 
     fn add_to_outgoing(&mut self, mut fds: Vec<RawFd>) {
         // Just in case there were other file descriptors added, pull them from the channel.
-        while let Ok(fd) = self.outgoing_rx.try_recv() {
+        while let Ok(fd) = self.outgoing_rx.as_mut().unwrap().try_recv() {
             fds.push(fd);
         }
         // Push all the file descriptors to the channel in order.
@@ -160,13 +171,18 @@ impl<T: AsRawFd> UnixFdStream<T> {
                 // This is impossible as we own the rx, but just for completeness.
                 // SAFETY: We own this file descriptor and are about to drop it on the
                 //         floor, so it's safe to close it.
-                unsafe { libc::close(fd.0); }
+                unsafe {
+                    libc::close(fd.0);
+                }
             }
         }
     }
 
     fn raw_write(socket: RawFd, outgoing_fds: &[RawFd], buf: &[u8]) -> Result<usize> {
-        let header = Header::new(outgoing_fds.len())?;
+        if outgoing_fds.is_empty() {
+            return Self::write_simple(socket, buf);
+        }
+        let header = crate::header::Header::new(outgoing_fds.len())?;
         let mut iov = libc::iovec {
             iov_base: buf.as_ptr() as *mut c_void,
             iov_len: buf.len(),
@@ -208,16 +224,9 @@ impl<T: AsRawFd> UnixFdStream<T> {
         Ok(rv as usize)
     }
 
-    fn read_simple(&self, buf: &mut [u8]) -> Result<usize> {
+    fn read_simple(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
         // SAFETY: The socket is owned by us and the buffer is of known size.
-        let rv = unsafe {
-            libc::recv(
-                self.inner.as_raw_fd(),
-                buf.as_mut_ptr() as *mut c_void,
-                buf.len(),
-                0,
-            )
-        };
+        let rv = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut c_void, buf.len(), 0) };
         if rv < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -265,13 +274,17 @@ impl<T: AsRawFd> UnixFdStream<T> {
         Ok(read_fds)
     }
 
-    fn raw_read(&self, buf: &mut [u8]) -> Result<usize> {
+    fn raw_read(
+        max_read_fds: usize,
+        fd: RawFd,
+        buf: &mut [u8],
+    ) -> Result<(usize, VecDeque<RawFd>)> {
         // Shortcut in case this was used without any file descriptor
         // read buffer, maybe the user just wants to send file descriptors.
-        if self.max_read_fds == 0 {
-            return self.read_simple(buf);
+        if max_read_fds == 0 {
+            return Self::read_simple(fd, buf).map(|bytes| (bytes, VecDeque::new()));
         }
-        let header = Header::new(self.max_read_fds)?;
+        let header = crate::header::Header::new(max_read_fds)?;
         let mut iov = libc::iovec {
             iov_base: buf.as_mut_ptr() as *mut c_void,
             iov_len: buf.len(),
@@ -289,29 +302,25 @@ impl<T: AsRawFd> UnixFdStream<T> {
         };
         // SAFETY: We own the socket and have just created and set up the message
         //         headers correctly.
-        let read_bytes = match unsafe { libc::recvmsg(self.inner.as_raw_fd(), &mut msg, 0) } {
-            0 => return Ok(0),
+        let read_bytes = match unsafe { libc::recvmsg(fd, &mut msg, 0) } {
+            0 => return Ok((0, VecDeque::new())),
             rv if rv < 0 => Err(Error::last_os_error()),
             rv => Ok(rv as usize),
         }?;
-        let mut read_fds = UnixFdStream::<T>::read_fds(&msg)?;
-        if let Ok(mut guard) = self.incoming_fds.lock() {
-            guard.append(&mut read_fds);
-        } else {
-            // SAFETY: We own the file descriptors, so it's safe to close them.
-            unsafe {
-                close_fds(read_fds);
-            }
-        }
-        Ok(read_bytes)
+        let read_fds = UnixFdStream::<T>::read_fds(&msg)?;
+        Ok((read_bytes, read_fds))
     }
 }
 
 impl<T: AsRawFd> Drop for UnixFdStream<T> {
     fn drop(&mut self) {
-        while let Ok(fd) = self.outgoing_rx.try_recv() {
-            // SAFETY: It we own these file descriptors, so it's safe for us to close them.
-            unsafe { libc::close(fd); };
+        if let Some(outgoing_rx) = &mut self.outgoing_rx {
+            while let Ok(fd) = outgoing_rx.try_recv() {
+                // SAFETY: It we own these file descriptors, so it's safe for us to close them.
+                unsafe {
+                    libc::close(fd);
+                };
+            }
         }
 
         self.incoming_fds.clear_poison();
@@ -334,8 +343,18 @@ impl<T: AsRawFd> AsyncRead for UnixFdStream<T> {
             let mut guard = ready!(self.inner.poll_read_ready(cx))?;
 
             let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|_inner| self.raw_read(unfilled)) {
-                Ok(Ok(len)) => {
+            match guard
+                .try_io(|inner| Self::raw_read(self.max_read_fds, inner.as_raw_fd(), unfilled))
+            {
+                Ok(Ok((len, mut read_fds))) => {
+                    if let Ok(mut guard) = self.incoming_fds.lock() {
+                        guard.append(&mut read_fds);
+                    } else {
+                        // SAFETY: We own the file descriptors, so it's safe to close them.
+                        unsafe {
+                            close_fds(read_fds);
+                        }
+                    }
                     buf.advance(len);
                     return Poll::Ready(Ok(()));
                 }
@@ -346,7 +365,7 @@ impl<T: AsRawFd> AsyncRead for UnixFdStream<T> {
     }
 }
 
-impl AsyncWrite for UnixFdStream<UnixStream> {
+impl<T: AsRawFd + Shutdown + Unpin> AsyncWrite for UnixFdStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -354,7 +373,7 @@ impl AsyncWrite for UnixFdStream<UnixStream> {
     ) -> Poll<std::result::Result<usize, std::io::Error>> {
         let mut outgoing_fds = Vec::<RawFd>::new();
         loop {
-            while let Ok(fd) = self.outgoing_rx.try_recv() {
+            while let Ok(fd) = self.outgoing_rx.as_mut().unwrap().try_recv() {
                 outgoing_fds.push(fd);
             }
             let mut guard = match self.inner.poll_write_ready(cx) {
@@ -366,25 +385,21 @@ impl AsyncWrite for UnixFdStream<UnixStream> {
                 Poll::Pending => {
                     self.add_to_outgoing(outgoing_fds);
                     return Poll::Pending;
-                },
+                }
             };
-            match guard.try_io(|inner| 
-                // Shortcut if there's no file descriptors to send.
-                if outgoing_fds.is_empty() {
-                    UnixFdStream::<UnixStream>::write_simple(inner.as_raw_fd(), buf)
-                } else {
-                    UnixFdStream::<UnixStream>::raw_write(inner.as_raw_fd(), &outgoing_fds, buf)
-                }) {
+            match guard.try_io(|inner| {
+                UnixFdStream::<UnixStream>::raw_write(inner.as_raw_fd(), &outgoing_fds, buf)
+            }) {
                 Ok(Ok(bytes)) => {
                     // SAFETY: We own the file descriptors, so it's safe to close them.
                     unsafe {
                         close_fds(outgoing_fds);
                     }
-                    return Poll::Ready(Ok(bytes))
+                    return Poll::Ready(Ok(bytes));
                 }
                 Ok(Err(err)) => {
                     self.add_to_outgoing(outgoing_fds);
-                    return Poll::Ready(Err(err))
+                    return Poll::Ready(Err(err));
                 }
                 Err(_would_block) => continue,
             }
@@ -402,8 +417,10 @@ impl AsyncWrite for UnixFdStream<UnixStream> {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<std::result::Result<(), std::io::Error>> {
-        self.inner.get_ref().shutdown(std::net::Shutdown::Write)?;
-        Poll::Ready(Ok(()))
+        Poll::Ready(Shutdown::shutdown(
+            self.inner.get_ref(),
+            std::net::Shutdown::Write,
+        ))
     }
 }
 
@@ -442,8 +459,12 @@ mod tests {
                     lines.get_ref().get_ref().pop_incoming_fd().unwrap(),
                 )
             };
-            let fourth = tokio::io::BufReader::new(tokio::net::UnixStream::from_std(fourth).unwrap());
-            assert_eq!(Some("test"), fourth.lines().next_line().await.unwrap().as_deref());
+            let fourth =
+                tokio::io::BufReader::new(tokio::net::UnixStream::from_std(fourth).unwrap());
+            assert_eq!(
+                Some("test"),
+                fourth.lines().next_line().await.unwrap().as_deref()
+            );
         });
         let (send_result, receive_result) = tokio::join!(sender, receiver);
         send_result.unwrap();
