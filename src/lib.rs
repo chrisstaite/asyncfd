@@ -12,8 +12,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 mod header;
-mod split;
-mod split_owned;
+pub mod split;
+pub mod split_owned;
 
 /// A wrapper around a `UnixStream` that allows file descriptors to be
 /// sent and received with messages.  Implements `AsyncRead` and
